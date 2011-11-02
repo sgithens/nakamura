@@ -93,10 +93,13 @@ import org.sakaiproject.nakamura.api.lite.Session;
 import org.sakaiproject.nakamura.api.lite.StorageClientException;
 import org.sakaiproject.nakamura.api.lite.StorageClientUtils;
 import org.sakaiproject.nakamura.api.lite.accesscontrol.AccessControlManager;
+import org.sakaiproject.nakamura.api.lite.accesscontrol.AccessDeniedException;
 import org.sakaiproject.nakamura.api.lite.accesscontrol.Permission;
 import org.sakaiproject.nakamura.api.lite.accesscontrol.Permissions;
 import org.sakaiproject.nakamura.api.lite.accesscontrol.Security;
+import org.sakaiproject.nakamura.api.lite.authorizable.Authorizable;
 import org.sakaiproject.nakamura.api.lite.authorizable.AuthorizableManager;
+import org.sakaiproject.nakamura.api.lite.authorizable.Group;
 import org.sakaiproject.nakamura.api.lite.content.Content;
 import org.sakaiproject.nakamura.api.user.UserConstants;
 import org.sakaiproject.nakamura.util.ExtendedJSONWriter;
@@ -348,11 +351,21 @@ public class LiteBasicLTIConsumerServlet extends SlingAllMethodsServlet {
       return;
     }
   }
+  
+  protected String findContextId(Content pooledContentNode, String groupOrWorldId) {
+	  return null;
+  }
 
   protected void doLaunch(SlingHttpServletRequest request,
       SlingHttpServletResponse response) throws ServletException, IOException {
     LOG.debug("doLaunch(SlingHttpServletRequest request, SlingHttpServletResponse response)");
     final Resource resource = request.getResource();
+    Map params = request.getParameterMap();
+    for (Object key: params.keySet()) {
+       Object val = params.get(key);
+       LOG.warn(key + " : " + params.get(key)); 
+    }
+   
     if (resource == null) {
       sendError(HttpServletResponse.SC_NOT_FOUND, "Resource could not be found",
           new Error("Resource could not be found"), response);
@@ -425,11 +438,29 @@ public class LiteBasicLTIConsumerServlet extends SlingAllMethodsServlet {
             new IllegalStateException(message), response);
         return;
       }
-      final String sitePath = pooledContentNode.getPath();
-      final String contextId = contextIdResolver.resolveContextId(pooledContentNode);
+      
+      final String sitePath;
+      final boolean usingGroup;
+      if (request.getParameter("groupid") != null) {
+          sitePath = request.getParameter("groupid");
+          usingGroup = true;
+      }
+      else {
+          sitePath = pooledContentNode.getPath();
+          usingGroup = false;
+      }
+      
+      final String contextId;
+      if (usingGroup) {
+          contextId = sitePath;
+      }
+      else {
+          contextId = contextIdResolver.resolveContextId(pooledContentNode);
+      }
       if (contextId == null) {
         throw new IllegalStateException("Could not resolve context_id!");
       }
+      
       launchProps.put(CONTEXT_ID, contextId);
       if ("sakai/pooled-content".equals(pooledContentNode
           .getProperty("sling:resourceType"))) {
@@ -457,18 +488,35 @@ public class LiteBasicLTIConsumerServlet extends SlingAllMethodsServlet {
       // Maybe Group should be used for project sites?
       launchProps.put(CONTEXT_TYPE, "CourseSection");
 
-      final org.sakaiproject.nakamura.api.lite.accesscontrol.AccessControlManager accessControlManager = session
-          .getAccessControlManager();
-      final boolean canManageSite = accessControlManager.can(az, Security.ZONE_CONTENT,
-          sitePath, Permissions.CAN_WRITE_ACL);
-      LOG.info("hasPrivileges(modifyAccessControl)=" + canManageSite);
-      if (UserConstants.ANON_USERID.equals(session.getUserId())) {
-        launchProps.put(ROLES, "None");
-      } else if (canManageSite) {
-        launchProps.put(ROLES, "Instructor");
-      } else {
-        launchProps.put(ROLES, "Learner");
+      
+      
+      if (usingGroup) {
+        String role = getUsersRoleInGroup(session, session.getUserId(), sitePath);
+        if (role.equals("manager")) {
+          launchProps.put(ROLES, "Instructor");          
+        } 
+        else if (role.equals("member")) {
+          launchProps.put(ROLES, "Learner");
+        }
+        else {
+          launchProps.put(ROLES, "None");
+        } 
       }
+      else {
+        final org.sakaiproject.nakamura.api.lite.accesscontrol.AccessControlManager accessControlManager = session
+                .getAccessControlManager();
+        final boolean canManageSite = accessControlManager.can(az, Security.ZONE_CONTENT,
+            sitePath, Permissions.CAN_WRITE_ACL);
+        LOG.info("hasPrivileges(modifyAccessControl)=" + canManageSite);
+        if (UserConstants.ANON_USERID.equals(session.getUserId())) {
+          launchProps.put(ROLES, "None");
+        } else if (canManageSite) {
+          launchProps.put(ROLES, "Instructor");
+        } else {
+          launchProps.put(ROLES, "Learner");
+        }
+      }
+      
 
       final boolean releaseNames = (Boolean)effectiveSettings
           .get(RELEASE_NAMES);
@@ -538,6 +586,50 @@ public class LiteBasicLTIConsumerServlet extends SlingAllMethodsServlet {
       return;
     }
     response.setStatus(HttpServletResponse.SC_OK);
+  }
+  
+  /*
+   * 
+   */
+  protected boolean isRecursiveRole(Session session, String userid, String groupid, String role) throws StorageClientException, AccessDeniedException {
+    AuthorizableManager authorizableManager = session.getAuthorizableManager();
+    String roleGroup = groupid+"-"+role;
+    Group group = (Group) authorizableManager.findAuthorizable(roleGroup);
+    if (group == null) return false;
+    // What's the best way in Java these days to make a list from an array.
+    ArrayList<String> members = new ArrayList<String>();
+    for (String member: group.getMembers()) { members.add(member); }
+    if (members.contains(userid)) {
+      return true;
+    }
+    else if (role.equals("manager")) {
+      // This needs to be fully recursive to run through all members of rep:group-managers,
+      // whose members can be Users or Groups, I don't see how to test if something is a Group
+      // though, I guess you need to fetch the Authorizable and see what is an 'instance of'.
+      // For prototyping I'm just attaching -manager, even though this is what would be 
+      // contained in rep:group-managers, among other things
+      return isRecursiveRole(session, userid, groupid+"-manager", role);
+    }
+    else if (role.equals("member")) {
+      // See above comment, but this would be fully recursive based on lists contained in
+      // rep:group-viewers
+      return isRecursiveRole(session, userid, groupid+"-member", role);
+    }
+    else {
+      return false;
+    }
+  }
+  
+  protected String getUsersRoleInGroup(Session session, String userid, String groupid) throws StorageClientException, AccessDeniedException {
+    if (isRecursiveRole(session, userid, groupid, "manager")) {
+      return "manager";
+    }
+    else if (isRecursiveRole(session, userid, groupid, "member")) {
+      return "member";
+    }
+    else {
+      return UserConstants.ANON_USERID;
+    }
   }
 
   /**
